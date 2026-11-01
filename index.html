@@ -30,7 +30,7 @@ footer{padding:12px 16px;display:flex;flex-direction:column;gap:8px}
  <div id="bar"><i></i></div><div id="msg"></div>
  <div class="row">
   <button id="play" disabled>Play</button><button id="replay" disabled>Replay</button>
-  <span id="cur">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" disabled><span id="tot">0:00</span>
+  <label style="color:#8a8a96;white-space:nowrap"><input type="checkbox" id="orig"> original</label><span id="cur">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" disabled><span id="tot">0:00</span>
  </div>
 </footer>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -91,9 +91,9 @@ async function renderTone(){
   buf=await oc.startRendering();
 }
 const pos=()=>playing?Math.min(AC.currentTime-startAt,dur):offset;
-function stop(){if(src){src.onended=null;try{src.stop()}catch(e){}src=null}}
+function stop(){if(osrc){try{osrc.stop()}catch(e){}osrc=null}if(src){src.onended=null;try{src.stop()}catch(e){}src=null}}
 function play(from){stop();offset=from;src=AC.createBufferSource();src.buffer=buf;src.connect(AC.destination);
-  AC.resume();src.start(0,from);startAt=AC.currentTime-from;playing=true;$('play').textContent='Pause'}
+  AC.resume();if(orig&&$('orig').checked){osrc=AC.createBufferSource();osrc.buffer=orig;const g=AC.createGain();g.gain.value=.7;osrc.connect(g);g.connect(AC.destination);osrc.start(0,from)}src.start(0,from);startAt=AC.currentTime-from;playing=true;$('play').textContent='Pause'}
 function pause(){offset=pos();stop();playing=false;$('play').textContent='Play'}
 $('play').onclick=()=>playing?pause():play(offset>=dur?0:offset);
 $('replay').onclick=()=>play(0);
@@ -133,7 +133,31 @@ function arrange(ns){let pos=1,prev=null;return ns.map(n=>{let m=n.midi;while(m<
 async function loadNotes(ns,d){pause();notes=ns;dur=d;raw=karplus();$('msg').textContent='Rendering tone…';await renderTone();
  $('msg').textContent=notes.length+' notes';$('tot').textContent=fmt(dur);offset=0;$('bar').firstChild.style.width='100%';
  ['play','replay','seek'].forEach(i=>$(i).disabled=false)}
-async function analyzeBuffer(ab){
+let orig=null,osrc=null;$('orig').onchange=()=>{if(playing)play(pos())};
+function fft(re,im){const n=re.length;for(let i=1,j=0;i<n;i++){let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]]}}
+ for(let len=2;len<=n;len<<=1){const a=-2*Math.PI/len,wr=Math.cos(a),wi=Math.sin(a);for(let i=0;i<n;i+=len){let cr=1,ci=0;for(let k=0;k<len/2;k++){const u=i+k,v=u+len/2,tr=re[v]*cr-im[v]*ci,ti=re[v]*ci+im[v]*cr;re[v]=re[u]-tr;im[v]=im[u]-ti;re[u]+=tr;im[u]+=ti;const t=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=t}}}}
+async function analyzeBuffer(ab){orig=ab;
+ const fac=Math.max(1,Math.round(ab.sampleRate/22050)),sr=ab.sampleRate/fac,ch=ab.getChannelData(0);
+ const N=Math.min(Math.floor(ch.length/fac),Math.floor(120*sr)),x=new Float32Array(N);
+ for(let i=0;i<N;i++){let s=0;for(let k=0;k<fac;k++)s+=ch[i*fac+k];x[i]=s/fac}
+ const W=4096,HOP=1024,re=new Float64Array(W),im=new Float64Array(W),mag=new Float64Array(W/2),hann=new Float64Array(W).map((_,i)=>.5-.5*Math.cos(2*Math.PI*i/W));
+ const kLo=Math.floor(130*W/sr),kHi=Math.floor(1000*W/sr),mid=[];
+ for(let p=0;p+W<N;p+=HOP){
+  let e=0;for(let j=0;j<W;j++){const v=x[p+j];e+=v*v;re[j]=v*hann[j];im[j]=0}
+  let m=-1;
+  if(Math.sqrt(e/W)>.004){fft(re,im);for(let k=0;k<W/2;k++)mag[k]=Math.log(1+10*Math.hypot(re[k],im[k]));
+   let bs=-1,bk=kLo;for(let k=kLo;k<=kHi;k++){const sc=mag[k]+mag[2*k]+mag[3*k]+mag[4*k];if(sc>bs){bs=sc;bk=k}}
+   const a=mag[bk-1],b=mag[bk],c=mag[bk+1],off=(a-c)/(2*(a-2*b+c)||1);
+   m=Math.round(69+12*Math.log2((bk+off)*sr/W/440))}
+  mid.push(m);
+  if(mid.length%40==0){$('bar').firstChild.style.width=(p/N*100)+'%';await new Promise(r=>setTimeout(r))}}
+ const med=mid.map((_,i)=>{const w=mid.slice(Math.max(0,i-2),i+3).sort((a,b)=>a-b);return w[w.length>>1]});
+ const dt=HOP/sr,ns=[];
+ for(let i=0;i<med.length;){let j=i;while(j<med.length&&med[j]===med[i])j++;if(med[i]>=0&&j-i>=2)ns.push({t:i*dt,dur:(j-i)*dt,midi:med[i]});i=j}
+ for(let i=0;i<ns.length-1;i++){const g=ns[i+1].t-(ns[i].t+ns[i].dur);if(g<.12)ns[i].dur+=g}
+ if(!ns.length)throw new Error('No clear melody found');
+ return [arrange(ns),N/sr]}
+async function analyzeOld(ab){
  const fac=Math.max(1,Math.round(ab.sampleRate/22050)),sr=ab.sampleRate/fac,ch=ab.getChannelData(0);
  const N=Math.min(Math.floor(ch.length/fac),Math.floor(120*sr)),x=new Float32Array(N);
  for(let i=0;i<N;i++){let s=0;for(let k=0;k<fac;k++)s+=ch[i*fac+k];x[i]=s/fac}

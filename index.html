@@ -8,7 +8,7 @@
 header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 16px}
 button,label.f{background:var(--card);color:var(--fg);border:1px solid #2a2a33;border-radius:8px;padding:8px 14px;cursor:pointer;font:inherit}
 button.on,button.go{background:var(--ac);border-color:var(--ac);color:#111;font-weight:600}
-button:disabled{opacity:.4}input[type=file]{display:none}
+button:disabled{opacity:.4}label.f{position:relative;overflow:hidden;display:inline-block}input[type=file]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;font-size:100px}
 #name{color:var(--mut);max-width:30ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #view{flex:1;min-height:0}canvas{display:block;width:100%;height:100%}
 footer{padding:12px 16px;display:flex;flex-direction:column;gap:8px}
@@ -17,9 +17,12 @@ footer{padding:12px 16px;display:flex;flex-direction:column;gap:8px}
 #msg{color:var(--mut);font-size:12px;min-height:16px}
 </style></head><body>
 <header>
- <label class="f">Upload song<input id="file" type="file" accept=".mp3,.wav,audio/*"></label>
+ <label class="f">Upload song<input id="file" type="file"></label>
  <span id="name">No file</span>
  <span id="tones"><button data-t="clean" class="on">Clean</button> <button data-t="overdrive">Overdrive</button> <button data-t="distortion">Distortion</button></span>
+ <button id="demo">Try demo</button>
+ <button id="rec">Record mic</button>
+ <input id="txt" placeholder="Type notes: E4 E4 F4 G4" style="background:#15151b;color:#e8e8ee;border:1px solid #2a2a33;border-radius:8px;padding:8px;width:200px"><button id="typed">Play notes</button>
  <button id="analyze" class="go" disabled>Analyze</button>
 </header>
 <div id="view"></div>
@@ -121,22 +124,54 @@ function frame(){
   if(dur){$('cur').textContent=fmt(t);$('seek').value=t/dur*1000;if(playing&&t>=dur)pause()}
 }
 frame();
-/* ---------- upload / analyze ---------- */
+/* ---------- in-browser analysis (YIN pitch tracker) ---------- */
+const OPEN=[40,45,50,55,59,64];
+function arrange(ns){let pos=1,prev=null;return ns.map(n=>{let m=n.midi;while(m<40)m+=12;while(m>81)m-=12;let best=null;
+ OPEN.forEach((o,s)=>{const f=m-o;if(f>=0&&f<=17){const c=(f?Math.abs(f-pos):.5)+(prev!==null?Math.abs(s-prev)*.15:0);if(!best||c<best[0])best=[c,s,f]}});
+ const [,s,f]=best;if(f&&!(f>=pos&&f<=pos+3))pos=Math.max(1,f-1);prev=s;
+ return {t:n.t,dur:n.dur,pitch:OPEN[s]+f,string:s,fret:f,finger:f?Math.min(Math.max(f-pos+1,1),4):0,hand:pos}})}
+async function loadNotes(ns,d){pause();notes=ns;dur=d;raw=karplus();$('msg').textContent='Rendering tone…';await renderTone();
+ $('msg').textContent=notes.length+' notes';$('tot').textContent=fmt(dur);offset=0;$('bar').firstChild.style.width='100%';
+ ['play','replay','seek'].forEach(i=>$(i).disabled=false)}
+async function analyzeBuffer(ab){
+ const fac=Math.max(1,Math.round(ab.sampleRate/22050)),sr=ab.sampleRate/fac,ch=ab.getChannelData(0);
+ const N=Math.min(Math.floor(ch.length/fac),Math.floor(120*sr)),x=new Float32Array(N);
+ for(let i=0;i<N;i++){let s=0;for(let k=0;k<fac;k++)s+=ch[i*fac+k];x[i]=s/fac}
+ const W=1024,HOP=640,t0=Math.floor(sr/1319),t1=Math.floor(sr/82),mid=[],d=new Float32Array(t1+2);
+ for(let p=0;p+W+t1<N;p+=HOP){
+  let e=0;for(let j=0;j<W;j++)e+=x[p+j]*x[p+j];let m=-1;
+  if(Math.sqrt(e/W)>.01){let run=0;d[0]=1;
+   for(let tau=1;tau<=t1;tau++){let s=0;for(let j=0;j<W;j++){const v=x[p+j]-x[p+j+tau];s+=v*v}run+=s;d[tau]=s*tau/run}
+   for(let tau=Math.max(2,t0);tau<t1;tau++)if(d[tau]<.15){while(tau+1<t1&&d[tau+1]<d[tau])tau++;m=Math.round(69+12*Math.log2(sr/tau/440));break}}
+  mid.push(m);
+  if(mid.length%60==0){$('bar').firstChild.style.width=(p/N*100)+'%';await new Promise(r=>setTimeout(r))}}
+ const med=mid.map((_,i)=>{const w=mid.slice(Math.max(0,i-2),i+3).sort((a,b)=>a-b);return w[w.length>>1]});
+ const dt=HOP/sr,ns=[];
+ for(let i=0;i<med.length;){let j=i;while(j<med.length&&med[j]===med[i])j++;if(med[i]>=0&&j-i>=3)ns.push({t:i*dt,dur:(j-i)*dt,midi:med[i]});i=j}
+ if(!ns.length)throw new Error('No clear melody found');
+ return [arrange(ns),N/sr]}
 let file=null;
 $('file').onchange=e=>{file=e.target.files[0];if(file){$('name').textContent=file.name;$('analyze').disabled=false}};
-$('analyze').onclick=async()=>{
-  pause();$('analyze').disabled=true;$('msg').textContent='Uploading…';
-  const fd=new FormData();fd.append('file',file);
-  try{
-    const {job}=await (await fetch('/analyze',{method:'POST',body:fd})).json();
-    let s;do{await new Promise(r=>setTimeout(r,700));s=await (await fetch('/status/'+job)).json();
-      $('bar').firstChild.style.width=(s.p*100)+'%';$('msg').textContent=s.error||s.stage}while(!s.done);
-    if(s.error)throw new Error(s.error);
-    notes=s.notes;dur=s.duration;raw=karplus();$('msg').textContent='Rendering tone…';await renderTone();
-    $('msg').textContent=`${notes.length} notes · ~${Math.round(s.tempo)} BPM`;
-    $('tot').textContent=fmt(dur);offset=0;['play','replay','seek'].forEach(i=>$(i).disabled=false);
-  }catch(err){$('msg').textContent='Error: '+err.message}
-  $('analyze').disabled=false;
-};
+$('demo').onclick=()=>{const m=[64,64,65,67,67,65,64,62,60,60,62,64,64,62,62];let t=.3;
+ const ns=m.map((p,i)=>{const d=i==12?.6:i==13?.2:i==14?.8:.4;const n={t,dur:d*.9,midi:p};t+=d;return n});
+ $('name').textContent='Demo: Ode to Joy';loadNotes(arrange(ns),t+.5)};
+$('typed').onclick=()=>{const M={C:0,D:2,E:4,F:5,G:7,A:9,B:11};let t=.3;const ns=[];
+ for(const k of $('txt').value.trim().split(/\s+/)){const m=/^([A-Ga-g])([#b]?)(\d)$/.exec(k);if(!m){t+=.45;continue}
+  const p=(+m[3]+1)*12+M[m[1].toUpperCase()]+(m[2]=='#'?1:m[2]=='b'?-1:0);ns.push({t,dur:.4,midi:p});t+=.45}
+ if(!ns.length){$('msg').textContent='Type notes like: E4 E4 F4 G4 G4 F4 E4 D4';return}
+ $('name').textContent='Typed melody';loadNotes(arrange(ns),t+.5)};
+async function recStart(){
+ try{const st=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+  const mr=new MediaRecorder(st),ch=[];mr.ondataavailable=e=>ch.push(e.data);
+  mr.onstop=async()=>{st.getTracks().forEach(t=>t.stop());$('rec').textContent='Record mic';$('msg').textContent='Analyzing…';
+   try{const ab=await AC.decodeAudioData(await new Blob(ch,{type:mr.mimeType}).arrayBuffer());const [ns,d]=await analyzeBuffer(ab);$('name').textContent='Mic recording';await loadNotes(ns,d)}catch(e){$('msg').textContent='Error: '+e.message}};
+  mr.start();let s=20;$('rec').textContent='Stop ('+s+')';$('msg').textContent='Recording… play the song near the mic, or sing/hum/whistle the melody';
+  const iv=setInterval(()=>{s--;$('rec').textContent='Stop ('+s+')';if(s<=0)$('rec').click()},1000);
+  $('rec').onclick=()=>{clearInterval(iv);if(mr.state!='inactive')mr.stop();$('rec').onclick=recStart};
+ }catch(e){$('msg').textContent='Microphone unavailable: '+e.message+' — try opening the link in Chrome/Safari'}}
+$('rec').onclick=recStart;
+$('analyze').onclick=async()=>{pause();$('analyze').disabled=true;$('msg').textContent='Decoding…';
+ try{const ab=await AC.decodeAudioData(await file.arrayBuffer());$('msg').textContent='Analyzing melody…';
+  const [ns,d]=await analyzeBuffer(ab);await loadNotes(ns,d)}catch(e){$('msg').textContent='Error: '+e.message}
+ $('analyze').disabled=false};
 </script></body></html>
-                    
